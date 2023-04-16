@@ -3,12 +3,16 @@
 #include <boost/enable_shared_from_this.hpp>
 #include <boost/shared_ptr.hpp>
 #include <boost/thread.hpp>
+#include <nlohmann/json.hpp>
+#include <mysqlx/xdevapi.h>
 #include <iostream>
 #include <vector>
 #include <set>
 #include <mutex>
 #include <deque>
 
+using json = nlohmann::json;
+using namespace mysqlx;
 using namespace boost::asio;
 
 class ChatSession;
@@ -23,11 +27,11 @@ public:
 	void join(boost::shared_ptr<ChatSession> session);
 	void leave(boost::shared_ptr<ChatSession> session);
 	void broadcast(const std::string& msg, boost::shared_ptr<ChatSession> sender);
-
+	void save_chat_data(const std::string& steamid, const std::string& _chatdata);
 private:
 	void start_accept();
 	void handle_accept(boost::shared_ptr<ChatSession> new_session, const boost::system::error_code& error);
-
+	Session connect_to_database();
 	io_context& io_context_;
 	ip::tcp::acceptor acceptor_;
 	boost::thread_group threads_;
@@ -108,6 +112,31 @@ void ChatServer::handle_accept(boost::shared_ptr<ChatSession> new_session, const
 	}
 }
 
+Session ChatServer::connect_to_database() {
+	try {
+		Session sess("localhost", 3306, "root", "password", "user_info_db");
+		return sess;
+	}
+	catch (const std::exception& e) {
+		std::cerr << "Database connection error: " << e.what() << std::endl;
+	}
+}
+
+void ChatServer::save_chat_data(const std::string& steamid, const std::string& _chatdata) {
+	try {
+		Session sess = connect_to_database();
+		Schema db = sess.getSchema("user_info_db");
+		Table chat_data = db.getTable("chat_data");
+
+		chat_data.insert("_steamid", "_chatdata")
+			.values(steamid, _chatdata)
+			.execute();
+	}
+	catch (const std::exception& e) {
+		std::cerr << "Error executing query: " << e.what() << std::endl;
+	}
+}
+
 ChatSession::ChatSession(io_context& io_context, ChatServer& server)
 	: socket_(io_context), server_(server) {}
 
@@ -136,6 +165,20 @@ void ChatSession::handle_read(const boost::system::error_code& error, std::size_
 		std::istream is(&read_buffer_);
 		std::getline(is, msg);
 		msg += '\n';
+
+		try {
+			json received_data = json::parse(msg);
+
+			std::string steamid = received_data["_steamid"].get<std::string>();
+			std::string _chatdata = received_data["_chatdata"].get<std::string>();
+
+			std::cout << "Received data: " << msg << std::endl;
+			server_.save_chat_data(steamid, _chatdata);
+		}
+		catch (const std::exception& e) {
+			std::cerr << "Error parsing JSON data: " << e.what() << std::endl;
+		}
+
 		server_.broadcast(msg, shared_from_this());
 		async_read_until(socket_, read_buffer_, "\n",
 			boost::bind(&ChatSession::handle_read, shared_from_this(),
